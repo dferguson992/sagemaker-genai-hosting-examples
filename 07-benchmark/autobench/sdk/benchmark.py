@@ -197,12 +197,60 @@ def get_role_arn():
 def endpoint_name(model_key=None):
     """Shared endpoint name for the entire benchmark run.
     The endpoint persists across model swaps; models deploy as inference components.
+    If a pre-existing endpoint is set via set_endpoint_name(), uses that.
+    Otherwise generates a name with a random salt.
     """
-    return "bench-autobench-ep"
+    if not hasattr(endpoint_name, "_cached"):
+        import hashlib
+        salt = hashlib.md5(os.urandom(8)).hexdigest()[:6]
+        endpoint_name._cached = f"bench-ep-{salt}"
+    return endpoint_name._cached
+
+
+def set_endpoint_name(name):
+    """Override the endpoint name with a pre-existing endpoint."""
+    endpoint_name._cached = name
 
 
 def ic_name(model_key):
-    return f"bench-ic-{model_key}"[:63]
+    """Inference component name for a model in this benchmark run.
+
+    Called from multiple sites (deploy, job submission, cleanup); all must
+    resolve to the SAME name within a single run. We therefore compute a
+    fresh run-suffix ONCE per (process, model_key) and cache it — mirroring
+    the endpoint_name._cached pattern.
+
+    Why a per-run suffix instead of a deterministic md5(model_key): the
+    SageMaker control plane can persist an old IC's configuration when an IC
+    with the SAME name is deleted and recreated within ~a day. A deterministic
+    name reuses the identifier and can be shadowed by stale config, so a
+    redeploy silently keeps the old environment. A unique per-run suffix
+    guarantees a never-before-seen IC name, sidestepping that bug.
+
+    Override with set_ic_run_suffix() for reproducible/idempotent redeploys.
+    """
+    import hashlib
+    if not hasattr(ic_name, "_cache"):
+        ic_name._cache = {}
+    if model_key not in ic_name._cache:
+        model_salt = hashlib.md5(model_key.encode()).hexdigest()[:4]
+        run_suffix = getattr(ic_name, "_run_suffix", None)
+        if run_suffix is None:
+            import time as _time
+            run_suffix = f"{int(_time.time()) % 100000:05d}"
+        ic_name._cache[model_key] = f"bench-ic-{model_key}-{model_salt}-{run_suffix}"[:63]
+    return ic_name._cache[model_key]
+
+
+def set_ic_run_suffix(suffix):
+    """Pin the IC run-suffix (e.g. to redeploy the exact same IC name).
+
+    Must be called BEFORE the first ic_name() call in the process. Clears any
+    cached names so the new suffix takes effect uniformly across call sites.
+    """
+    ic_name._run_suffix = str(suffix)
+    if hasattr(ic_name, "_cache"):
+        ic_name._cache.clear()
 
 
 def ensure_endpoint(client, defaults):
@@ -216,7 +264,7 @@ def ensure_endpoint(client, defaults):
     training_plan_arn = defaults.get("ml_reservation_arn")
     role = defaults.get("role_arn") or get_role_arn()
 
-    # Check if endpoint already exists and is InService
+    # Check if endpoint already exists
     try:
         resp = client.describe_endpoint(EndpointName=ep_name)
         status = resp["EndpointStatus"]
@@ -227,6 +275,8 @@ def ensure_endpoint(client, defaults):
             print(f"\n  ⏳ Endpoint {status}, waiting...")
             waiter = client.get_waiter("endpoint_in_service")
             waiter.wait(EndpointName=ep_name, WaiterConfig={"Delay": 30, "MaxAttempts": 60})
+            print(f"  ✓ Endpoint InService: {ep_name}")
+            return ep_name
             print(f"  ✓ Endpoint InService: {ep_name}")
             return ep_name
         elif status == "Failed":
@@ -253,8 +303,6 @@ def ensure_endpoint(client, defaults):
         "VariantName": "default",
         "InstanceType": instance_type,
         "InitialInstanceCount": 1,
-        "ModelDataDownloadTimeoutInSeconds": 1800,
-        "ContainerStartupHealthCheckTimeoutInSeconds": 1800,
         "ManagedInstanceScaling": {
             "Status": "ENABLED",
             "MinInstanceCount": 1,
@@ -289,16 +337,30 @@ def ensure_endpoint(client, defaults):
     }
     # Enable/disable detailed observability (enhanced IC-level metrics)
     # Defaults to true for configs created after June 17, 2026, but we set explicitly
-    metrics_config = {
-        "EnableDetailedObservability": detailed_observability,
-        "EnableEnhancedMetrics": defaults.get("monitoring", {}).get("enhanced_metrics", True),
-    }
-    publish_frequency = defaults.get("monitoring", {}).get("publish_frequency_seconds")
-    if publish_frequency:
-        metrics_config["MetricPublishFrequencyInSeconds"] = int(publish_frequency)
-    create_config_kwargs["MetricsConfig"] = metrics_config
+    # Note: MetricsConfig requires a recent boto3/botocore — fall back gracefully
+    monitoring_cfg = defaults.get("monitoring", {})
+    if monitoring_cfg:
+        metrics_config = {}
+        if "detailed_observability" in monitoring_cfg:
+            metrics_config["EnableDetailedObservability"] = monitoring_cfg["detailed_observability"]
+        if "enhanced_metrics" in monitoring_cfg:
+            metrics_config["EnableEnhancedMetrics"] = monitoring_cfg["enhanced_metrics"]
+        publish_frequency = monitoring_cfg.get("publish_frequency_seconds")
+        if publish_frequency:
+            metrics_config["MetricPublishFrequencyInSeconds"] = int(publish_frequency)
+        if metrics_config:
+            create_config_kwargs["MetricsConfig"] = metrics_config
 
-    client.create_endpoint_config(**create_config_kwargs)
+    try:
+        client.create_endpoint_config(**create_config_kwargs)
+    except Exception as e:
+        # Older botocore versions don't support MetricsConfig — retry without it
+        if "MetricsConfig" in create_config_kwargs and ("EnableDetailedObservability" in str(e) or "EnableEnhancedMetrics" in str(e) or "MetricsConfig" in str(e) or "Unknown parameter" in str(e) or "ParamValidation" in str(type(e).__name__)):
+            print(f"  ⚠️  MetricsConfig not supported by this SDK version ({type(e).__name__}: {e}) — skipping")
+            del create_config_kwargs["MetricsConfig"]
+            client.create_endpoint_config(**create_config_kwargs)
+        else:
+            raise
     print(f"  ✓ Created endpoint config: {ep_config_name}")
 
     client.create_endpoint(
@@ -309,7 +371,7 @@ def ensure_endpoint(client, defaults):
 
     print(f"  ⏳ Waiting for endpoint InService...")
     waiter = client.get_waiter("endpoint_in_service")
-    waiter.wait(EndpointName=ep_name, WaiterConfig={"Delay": 30, "MaxAttempts": 60})
+    waiter.wait(EndpointName=ep_name, WaiterConfig={"Delay": 30, "MaxAttempts": 120})
     print(f"  ✓ Endpoint InService: {ep_name}")
     return ep_name
 
@@ -339,7 +401,6 @@ def deploy_model(client, model_key, model_cfg, defaults):
     """
     ep_name = endpoint_name()
     component_name = ic_name(model_key)
-    sm_model_name = f"bench-mdl-{model_key}"[:63]
     role = defaults.get("role_arn") or get_role_arn()
     instance_type = model_cfg["instance_type"]
     num_gpus = model_cfg.get("num_gpus", 1)
@@ -368,6 +429,44 @@ def deploy_model(client, model_key, model_cfg, defaults):
     if hf_token:
         env_vars["HF_TOKEN"] = hf_token
 
+    # Pre-flight: if a chat template (or any /opt/ml/model file) is referenced
+    # via env, verify it's actually staged in s3_model_uri BEFORE we spend ~15
+    # min deploying. A missing/misnamed template otherwise surfaces as a cryptic
+    # ChatTemplateResolutionError deep in the serving logs. We check every env
+    # value that points at the mounted model dir, not just the chat template.
+    _MOUNT = "/opt/ml/model/"
+    if s3_model_uri:
+        mounted_refs = {
+            k: v for k, v in env_vars.items()
+            if isinstance(v, str) and v.startswith(_MOUNT)
+        }
+        if mounted_refs:
+            import urllib.parse
+            parsed = urllib.parse.urlparse(s3_model_uri)
+            bucket = parsed.netloc
+            prefix = parsed.path.lstrip("/")
+            if not prefix.endswith("/"):
+                prefix += "/"
+            s3c = boto3.client("s3", region_name=region)
+            missing = []
+            for env_key, mount_path in mounted_refs.items():
+                rel = mount_path[len(_MOUNT):]
+                key = prefix + rel
+                try:
+                    head = s3c.head_object(Bucket=bucket, Key=key)
+                    if head.get("ContentLength", 0) == 0:
+                        missing.append(f"{env_key}={mount_path} (s3://{bucket}/{key} is EMPTY)")
+                    else:
+                        print(f"  ✓ Pre-flight: {env_key} -> s3://{bucket}/{key} "
+                              f"({head['ContentLength']} bytes)")
+                except Exception as e:
+                    missing.append(f"{env_key}={mount_path} (s3://{bucket}/{key} NOT FOUND: {e})")
+            if missing:
+                msg = ("Pre-flight failed — env references files not staged in "
+                       f"{s3_model_uri}:\n    " + "\n    ".join(missing))
+                print(f"  ❌ {msg}")
+                return {"success": False, "status": "PreflightFailed", "error": msg}
+
     print(f"\n{'='*60}")
     print(f"[deploy IC] {model_key}")
     print(f"  image: {image}")
@@ -380,31 +479,7 @@ def deploy_model(client, model_key, model_cfg, defaults):
         print(f"  source: HuggingFace (direct download)")
     print(f"{'='*60}")
 
-    # 1. Create SageMaker Model (container definition)
-    try:
-        client.delete_model(ModelName=sm_model_name)
-    except Exception:
-        pass
-    container_def = {
-        "Image": image,
-        "Environment": env_vars,
-    }
-    if s3_model_uri:
-        container_def["ModelDataSource"] = {
-            "S3DataSource": {
-                "S3Uri": s3_model_uri,
-                "S3DataType": "S3Prefix",
-                "CompressionType": "None",
-            }
-        }
-    client.create_model(
-        ModelName=sm_model_name,
-        ExecutionRoleArn=role,
-        PrimaryContainer=container_def,
-    )
-    print(f"  ✓ Created model: {sm_model_name}")
-
-    # 2. Delete existing IC if present (from a previous failed run)
+    # 1. Delete existing IC if present (from a previous failed run)
     try:
         client.delete_inference_component(InferenceComponentName=component_name)
         print(f"  ⏳ Cleaning up stale IC: {component_name}")
@@ -412,25 +487,76 @@ def deploy_model(client, model_key, model_cfg, defaults):
     except Exception:
         pass
 
-    # 3. Create Inference Component on the shared endpoint
+    # 1b. Orphan cleanup — IC names now carry a per-run suffix, so ICs from
+    # prior runs (bench-ic-{model_key}-{salt}-{old_suffix}) linger and hold
+    # GPU reservations. Enumerate all ICs on the endpoint for this model_key
+    # and delete any that are NOT the current target before creating the new
+    # one, so unique naming doesn't leak accelerator capacity.
+    ic_prefix = f"bench-ic-{model_key}-"
+    try:
+        paginator = client.get_paginator("list_inference_components")
+        for page in paginator.paginate(EndpointNameEquals=ep_name):
+            for ic in page.get("InferenceComponents", []):
+                name = ic.get("InferenceComponentName", "")
+                if name.startswith(ic_prefix) and name != component_name:
+                    try:
+                        client.delete_inference_component(InferenceComponentName=name)
+                        print(f"  🧹 Deleting orphaned IC from prior run: {name}")
+                        _wait_for_ic_deleted(client, name)
+                    except Exception as e:
+                        print(f"  ⚠️  Could not delete orphaned IC {name}: {e}")
+    except Exception as e:
+        print(f"  ⚠️  Orphan-IC enumeration skipped ({e}); continuing.")
+
+    # 2. Create Inference Component on the shared endpoint
     compute_resources = {"NumberOfAcceleratorDevicesRequired": num_gpus}
-    # Optional compute constraints from model config
+    # MinMemoryRequiredInMb is required by the API
     cr_overrides = model_cfg.get("compute_resources", {})
-    if cr_overrides.get("min_memory_mb"):
-        compute_resources["MinMemoryRequiredInMb"] = int(cr_overrides["min_memory_mb"])
+    compute_resources["MinMemoryRequiredInMb"] = int(cr_overrides.get("min_memory_mb", 1024))
+    # Optional compute constraints from model config
     if cr_overrides.get("max_memory_mb"):
         compute_resources["MaxMemoryRequiredInMb"] = int(cr_overrides["max_memory_mb"])
     if cr_overrides.get("num_cpu_cores"):
         compute_resources["NumberOfCpuCoresRequired"] = float(cr_overrides["num_cpu_cores"])
 
     ic_spec = {
-        "ModelName": sm_model_name,
         "StartupParameters": {
             "ModelDataDownloadTimeoutInSeconds": 1800,
             "ContainerStartupHealthCheckTimeoutInSeconds": 1800,
         },
         "ComputeResourceRequirements": compute_resources,
     }
+
+    if s3_model_uri:
+        # S3 model data requires a SageMaker Model object (supports S3Prefix, not just tarballs)
+        sm_model_name = f"bench-mdl-{model_key}"[:63]
+        try:
+            client.delete_model(ModelName=sm_model_name)
+        except Exception:
+            pass
+        client.create_model(
+            ModelName=sm_model_name,
+            ExecutionRoleArn=role,
+            PrimaryContainer={
+                "Image": image,
+                "Environment": env_vars,
+                "ModelDataSource": {
+                    "S3DataSource": {
+                        "S3Uri": s3_model_uri,
+                        "S3DataType": "S3Prefix",
+                        "CompressionType": "None",
+                    }
+                },
+            },
+        )
+        print(f"  ✓ Created model: {sm_model_name}")
+        ic_spec["ModelName"] = sm_model_name
+    else:
+        # No S3 model — use inline Container (HuggingFace download via SM_VLLM_MODEL)
+        ic_spec["Container"] = {
+            "Image": image,
+            "Environment": env_vars,
+        }
 
     client.create_inference_component(
         InferenceComponentName=component_name,
@@ -459,7 +585,40 @@ def deploy_model(client, model_key, model_cfg, defaults):
         return {"success": False, "status": status, "error": f"IC reached {status}: {reason}"}
 
     print(f"  ✓ Inference component InService: {component_name}")
-    return {"success": True, "endpoint": ep_name, "inference_component": component_name, "model_name": sm_model_name}
+
+    # Post-deploy: assert the LIVE IC environment actually contains the env vars
+    # we set. Catches the control-plane stale-config regression where a
+    # delete+recreate on a previously-seen IC name silently shadows the new
+    # config with the old one. If a var we set is missing or wrong on the live
+    # component, fail loudly instead of running a benchmark against stale config.
+    try:
+        # Env lives in different places depending on deploy path:
+        #  - S3 model path: on the SageMaker Model's PrimaryContainer.Environment
+        #  - inline container path: on the IC Specification.Container.Environment
+        if s3_model_uri:
+            live_model = client.describe_model(ModelName=sm_model_name)
+            live_env = (live_model.get("PrimaryContainer", {}) or {}).get("Environment", {}) or {}
+        else:
+            live = client.describe_inference_component(InferenceComponentName=component_name)
+            spec = live.get("Specification", {})
+            live_env = (spec.get("Container", {}) or {}).get("Environment", {}) or {}
+        drift = []
+        for k, v in env_vars.items():
+            if k == "HF_TOKEN":
+                continue  # secret — not echoed back reliably
+            if live_env.get(k) != v:
+                drift.append(f"{k}: expected {v!r}, live {live_env.get(k)!r}")
+        if drift:
+            msg = ("Post-deploy config drift — live IC env does not match what we "
+                   "set (possible control-plane stale-config):\n    "
+                   + "\n    ".join(drift))
+            print(f"  ❌ {msg}")
+            return {"success": False, "status": "ConfigDrift", "error": msg}
+        print(f"  ✓ Post-deploy: live IC env matches ({len(env_vars)} vars verified)")
+    except Exception as e:
+        print(f"  ⚠️  Post-deploy env verification skipped ({e}); continuing.")
+
+    return {"success": True, "endpoint": ep_name, "inference_component": component_name}
 
 
 # --- Inference Recommender (Advanced) ---
@@ -573,9 +732,12 @@ def run_benchmark_job(client, job, ep_name, defaults, models=None):
     # Same seed = identical prompts across runs (AIPerf hash-based RNG derivation)
     if job.get("random_seed") is not None:
         workload_spec["parameters"]["random_seed"] = job["random_seed"]
-    # Only set public_dataset if a real dataset is specified (not "synthetic" or empty)
-    if job.get("dataset") and job["dataset"].lower() != "synthetic":
-        workload_spec["parameters"]["public_dataset"] = job["dataset"]
+    # Dataset: S3 URI (s3://...) handled via DatasetConfig; named datasets via public_dataset
+    dataset_val = job.get("dataset") or ""
+    if dataset_val.startswith("s3://"):
+        pass  # S3 dataset handled below via DatasetConfig
+    elif dataset_val and dataset_val.lower() != "synthetic":
+        workload_spec["parameters"]["public_dataset"] = dataset_val
 
     hf_secret = os.environ.get("HF_TOKEN_SECRET_ARN")
     if hf_secret:
@@ -587,11 +749,26 @@ def run_benchmark_job(client, job, ep_name, defaults, models=None):
     except Exception:
         pass
     try:
-        client.create_ai_workload_config(
-            AIWorkloadConfigName=config_name,
-            AIWorkloadConfigs={"WorkloadSpec": {"Inline": json.dumps(workload_spec)}},
-        )
+        create_wl_kwargs = {
+            "AIWorkloadConfigName": config_name,
+            "AIWorkloadConfigs": {"WorkloadSpec": {"Inline": json.dumps(workload_spec)}},
+        }
+        # S3 dataset: pass as DatasetConfig instead of inline synthetic parameters
+        if dataset_val.startswith("s3://"):
+            create_wl_kwargs["DatasetConfig"] = {
+                "InputDataConfig": [{
+                    "ChannelName": "dataset",
+                    "DataSource": {
+                        "S3DataSource": {
+                            "S3Uri": dataset_val,
+                        }
+                    },
+                }]
+            }
+        client.create_ai_workload_config(**create_wl_kwargs)
         print(f"  ✓ Created workload config: {config_name}")
+        if dataset_val.startswith("s3://"):
+            print(f"    dataset: {dataset_val}")
     except Exception as e:
         print(f"  ✗ Failed to create workload config: {e}")
         return {"success": False, "error": f"Failed to create workload config: {e}", "gap": classify_gap(str(e))}
@@ -610,6 +787,9 @@ def run_benchmark_job(client, job, ep_name, defaults, models=None):
             BenchmarkTarget={
                 "Endpoint": {
                     "Identifier": ep_name,
+                    "InferenceComponents": [
+                        {"Identifier": ic_name(job["model_key"])}
+                    ],
                 }
             },
             OutputConfig={"S3OutputLocation": s3_job_path},
@@ -716,7 +896,7 @@ def classify_gap(error_str):
 # --- Cleanup ---
 
 def cleanup_model(client, model_key):
-    """Delete the inference component and SageMaker model for a given model.
+    """Delete the inference component (and SageMaker Model if one was created).
     The shared endpoint is NOT deleted — it persists for the next model.
     """
     component_name = ic_name(model_key)
@@ -879,7 +1059,7 @@ def submit_processing_job(args, script_name, job_prefix, config_path):
             }
         },
         AppSpecification={
-            "ImageUri": f"763104351884.dkr.ecr.{region}.amazonaws.com/pytorch-training:2.5.1-cpu-py311",
+            "ImageUri": f"763104351884.dkr.ecr.{region}.amazonaws.com/pytorch-training:2.9.0-cpu-py312-ubuntu22.04-sagemaker-v1.9",
             "ContainerEntrypoint": ["python3", "/opt/ml/processing/input/script/script.py"],
             "ContainerArguments": ["/opt/ml/processing/input/script/benchmarks.yaml"] + container_args,
         },
@@ -920,8 +1100,14 @@ def main():
     if os.environ.get("PROCESSING_JOB_NAME") or os.path.exists("/opt/ml/processing"):
         if not os.environ.get("_DEPS_INSTALLED"):
             import subprocess
-            subprocess.run(["pip", "install", "-q", "-r", "/opt/ml/processing/input/script/requirements.txt"])
-            # Re-exec with updated packages
+            # The DLC has an old pinned botocore that pip won't upgrade past due to
+            # awscli dependency constraints. Remove awscli first to unblock the upgrade.
+            subprocess.run(["pip", "uninstall", "-q", "-y", "awscli"])
+            subprocess.run([
+                "pip", "install", "-q", "--upgrade",
+                "-r", "/opt/ml/processing/input/script/requirements.txt",
+            ])
+            # Re-exec so the new packages are loaded fresh
             os.environ["_DEPS_INSTALLED"] = "1"
             os.execv(sys.executable, [sys.executable] + sys.argv)
 
@@ -1026,6 +1212,12 @@ resume: re-run safely — completed jobs are skipped automatically
     using_external_endpoint = args.endpoint or all(
         config["models"][mk].get("endpoint_name", "") for mk in by_model
     )
+    # If sagemaker_defaults specifies an existing endpoint, use it directly (skip provisioning)
+    existing_ep = defaults_cfg.get("endpoint_name")
+    if existing_ep:
+        set_endpoint_name(existing_ep)
+        using_external_endpoint = True
+        print(f"\n  → Using pre-existing endpoint: {existing_ep}")
     if not using_external_endpoint and not args.benchmark_only:
         # Determine instance type: prefer sagemaker_defaults.endpoint_instance_type,
         # fall back to first model's instance_type in the benchmark matrix
